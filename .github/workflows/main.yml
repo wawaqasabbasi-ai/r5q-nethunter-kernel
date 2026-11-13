@@ -1,0 +1,103 @@
+name: R5Q NetHunter Kernel CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  compile-kernel:
+    name: Build R5Q LineageOS 20 NetHunter Kernel
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex git gnupg gperf imagemagick liblz4-tool libncurses5-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 device-tree-compiler cpio
+
+      - name: 3. Setup ZyC Clang 16 Toolchain
+        run: |
+          mkdir -p clang
+          wget -q https://github.com -O clang.tar.gz
+          tar -xzf clang.tar.gz -C clang
+          rm clang.tar.gz
+
+      - name: 4. Clone R5Q LineageOS 20 Kernel Source
+        run: |
+          git clone --depth=1 https://github.com -b lineage-20 kernel
+
+      - name: 5. Inject RTL8812AU & Wi-Fi Monitor Mode Patches
+        run: |
+          cd kernel/drivers/net/wireless
+          git clone --depth=1 https://github.com
+          sed -i 's/^CONFIG_PLATFORM_I386_PC = y/CONFIG_PLATFORM_I386_PC = n/' rtl8812au/Makefile
+          sed -i 's/^CONFIG_PLATFORM_ARM64_RPI = n/CONFIG_PLATFORM_ARM64_RPI = y/' rtl8812au/Makefile
+          echo 'obj-$(CONFIG_88XXAU) += rtl8812au/' >> Makefile
+          echo 'source "drivers/net/wireless/rtl8812au/Kconfig"' >> Kconfig
+          cd ../../..
+          git clone --depth=1 https://gitlab.com nh-builder
+          patch -p1 < nh-builder/patches/4.14/add-wifi-injection-4.14.patch || true
+
+      - name: 6. Configure Kernel (R5Q + RT3070 + RTL8812AU)
+        run: |
+          cd kernel
+          export ARCH=arm64
+          DEFCONFIG=$(find arch/arm64/configs -name "*r5q*defconfig" | sed 's|arch/arm64/configs/||' | head -n 1)
+          echo "Using defconfig: $DEFCONFIG"
+          make O=out $DEFCONFIG
+          ./scripts/config --file out/.config \
+            -e CFG80211 \
+            -e MAC80211 \
+            -e MAC80211_MESH \
+            -e CFG80211_WEXT \
+            -e WIRELESS_EXT \
+            -e WEXT_PRIV \
+            -e RT2X00 \
+            -e RT2800USB \
+            -e RT2800USB_RT33XX \
+            -e RT2800USB_RT35XX \
+            -e RT2800USB_RT3573 \
+            -e RT2800USB_RT53XX \
+            -e RT2800USB_RT55XX \
+            -e 88XXAU \
+            -e USB_CONFIGFS_F_HID \
+            -d MODULE_SIG \
+            -d MODULE_SIG_FORCE
+          make O=out olddefconfig
+
+      - name: 7. Compile Kernel Image
+        run: |
+          cd kernel
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          make -j$(nproc) O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            Image.gz-dtb
+
+      - name: 8. Pack AnyKernel3 Flashable Zip
+        run: |
+          git clone --depth=1 https://github.com
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+          cd AnyKernel3
+          zip -r9 ../R5Q-NetHunter-LOS20-MonitorMode.zip * -x .git README.md *placeholder
+
+      - name: 9. Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0-${{ github.run_number }}
+          name: R5Q NetHunter Kernel (Build #${{ github.run_number }})
+          body: |
+            ### Features Included:
+            - **Device:** Samsung Galaxy S10 Lite (`r5q`) - LineageOS 20
+            - **External Wi-Fi:** RT3070 (`rt2800usb`) + RTL8812AU (`88XXAU`)
+            - **Monitor Mode & Packet Injection:** Enabled
+            - **USB HID (BadUSB):** Enabled
+          files: R5Q-NetHunter-LOS20-MonitorMode.zip
